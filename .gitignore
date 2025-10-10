@@ -1,0 +1,15 @@
+# Python virtual environments and cache
+.env/
+.venv/
+.venv
+__pycache__/
+*.pyc
+
+# Token stores and other sensitive app data
+.schwab_tokens.json
+*.json
+*.log
+
+# Editor settings
+.vscode/
+.idea/
