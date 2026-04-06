@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import os
-import ssl
 import sys
 import threading
 import time
@@ -184,7 +183,12 @@ class SchwabAuthManager:
         return self._token_bundle
 
     def _save_tokens(self, bundle: TokenBundle) -> None:
-        self.token_store.write_text(json.dumps(bundle.to_json(), indent=2), encoding="utf-8")
+        content = json.dumps(bundle.to_json(), indent=2).encode("utf-8")
+        fd = os.open(str(self.token_store), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, content)
+        finally:
+            os.close(fd)
         self._token_bundle = bundle
 
     def exchange_code_for_token(self, authorization_response: str) -> TokenBundle:
@@ -962,9 +966,8 @@ class SchwabStreamerClient:
             "timestamp": info.get("tokenTimestamp") or info.get("tokenTimeStamp"),
             "appid": info.get("appId") or info.get("appID") or info.get("streamerAppId"),
         }
-        components = [f"{key}={value}" for key, value in fields.items() if value is not None]
-        encoded = quote_plus("&".join(components))
-        return encoded
+        components = [f"{key}={quote_plus(str(value))}" for key, value in fields.items() if value is not None]
+        return "&".join(components)
 
     def _book_fields(self, depth: int) -> str:
         # Field 0 = symbol, 1 = timestamp; bids occupy fields starting at 2, asks follow.
@@ -1153,11 +1156,11 @@ class OrderBookMapper:
                         )
                     except ValueError:
                         continue
-                trade_times.append(mdates.date2num(ts))
-                price_value = trade.get("price") or trade.get("P") or trade.get("p")
-                size_value = trade.get("size") or trade.get("quantity") or trade.get("Q") or trade.get("q")
+                price_value = next((trade[k] for k in ("price", "P", "p") if trade.get(k) is not None), None)
+                size_value = next((trade[k] for k in ("size", "quantity", "Q", "q") if trade.get(k) is not None), None)
                 if price_value is None or size_value is None:
                     continue
+                trade_times.append(mdates.date2num(ts))
                 trade_prices.append(float(price_value))
                 trade_sizes.append(float(size_value))
             if trade_times:
@@ -1219,8 +1222,16 @@ class OrderBookMapper:
         order_book: Dict[str, object],
         trades: Optional[List[Dict[str, object]]] = None,
     ) -> None:
-        bids_raw = order_book.get("bids") or order_book.get("bid") or []
-        asks_raw = order_book.get("asks") or order_book.get("ask") or []
+        bids_raw = order_book.get("bids")
+        if bids_raw is None:
+            bids_raw = order_book.get("bid")
+        if bids_raw is None:
+            bids_raw = []
+        asks_raw = order_book.get("asks")
+        if asks_raw is None:
+            asks_raw = order_book.get("ask")
+        if asks_raw is None:
+            asks_raw = []
         bids: List[tuple[float, float]] = []
         asks: List[tuple[float, float]] = []
         for raw in bids_raw:
@@ -1253,10 +1264,10 @@ class OrderBookMapper:
             latest_trade = None
             latest_time = None
             for trade in trades:
-                price_value = trade.get("price") or trade.get("P") or trade.get("p")
+                price_value = next((trade[k] for k in ("price", "P", "p") if trade.get(k) is not None), None)
                 if price_value is None:
                     continue
-                raw_time = trade.get("time") or trade.get("timestamp") or trade.get("datetime")
+                raw_time = next((trade[k] for k in ("time", "timestamp", "datetime") if trade.get(k) is not None), None)
                 if raw_time is None:
                     candidate_time = utc_now()
                 elif isinstance(raw_time, (int, float)):
@@ -1271,7 +1282,7 @@ class OrderBookMapper:
                 if not latest_trade or candidate_time >= latest_time:
                     latest_trade = float(price_value)
                     latest_time = candidate_time
-                size_value = trade.get("size") or trade.get("quantity") or trade.get("Q") or trade.get("q")
+                size_value = next((trade[k] for k in ("size", "quantity", "Q", "q") if trade.get(k) is not None), None)
                 if size_value is not None:
                     volume_total += float(size_value)
             if latest_trade is not None:
@@ -1320,20 +1331,20 @@ def poll_market_data(
     trade_lookback: int,
 ) -> None:
     last_trade_fetch = utc_now() - timedelta(seconds=trade_lookback)
-    while True:
-        try:
-            order_book = client.get_order_book(symbol=symbol, depth=depth)
-            trades = client.get_times_sales(symbol=symbol, since=last_trade_fetch)
-            last_trade_fetch = utc_now()
-            mapper.update(order_book, trades)
-        except KeyboardInterrupt:
-            LOGGER.info("Stopping mapper loop")
-            break
-        except requests.HTTPError as exc:
-            LOGGER.error("HTTP error while polling Schwab API: %s", exc)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.exception("Unexpected error while polling Schwab API: %s", exc)
-        time.sleep(max(interval, 0.5))
+    try:
+        while True:
+            try:
+                order_book = client.get_order_book(symbol=symbol, depth=depth)
+                trades = client.get_times_sales(symbol=symbol, since=last_trade_fetch)
+                last_trade_fetch = utc_now()
+                mapper.update(order_book, trades)
+            except requests.HTTPError as exc:
+                LOGGER.error("HTTP error while polling Schwab API: %s", exc)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.exception("Unexpected error while polling Schwab API: %s", exc)
+            time.sleep(max(interval, 0.5))
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping mapper loop")
 
 
 def stream_market_data(
